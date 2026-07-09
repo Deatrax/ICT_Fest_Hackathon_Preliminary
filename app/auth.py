@@ -2,6 +2,7 @@
 import hashlib
 import hmac
 import os
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -22,6 +23,11 @@ from .models import User
 # Access tokens presented to /auth/logout are recorded here so they can no
 # longer be used.
 _revoked_tokens: set[str] = set()
+
+# Refresh tokens are single-use: each jti is recorded here the first (and
+# only allowed) time it is presented to /auth/refresh.
+_revoked_refresh: set[str] = set()
+_refresh_lock = threading.Lock()
 
 _PBKDF2_ROUNDS = 100_000
 
@@ -47,7 +53,7 @@ def _now_ts() -> int:
 
 def create_access_token(user: User) -> str:
     iat = _now_ts()
-    lifetime = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES * 60)
+    lifetime = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {
         "sub": str(user.id),
         "org": user.org_id,
@@ -86,6 +92,19 @@ def revoke_access_token(payload: dict) -> None:
     _revoked_tokens.add(payload["jti"])
 
 
+def consume_refresh_token(payload: dict) -> None:
+    """Mark a refresh token's jti as spent; reject if already spent.
+
+    The check-and-add is atomic so two concurrent replays of the same token
+    cannot both succeed.
+    """
+    jti = payload["jti"]
+    with _refresh_lock:
+        if jti in _revoked_refresh:
+            raise AppError(401, "UNAUTHORIZED", "Refresh token already used")
+        _revoked_refresh.add(jti)
+
+
 def get_token_payload(request: Request) -> dict:
     header = request.headers.get("Authorization")
     if not header or not header.startswith("Bearer "):
@@ -94,7 +113,7 @@ def get_token_payload(request: Request) -> dict:
     payload = decode_token(token)
     if payload.get("type") != "access":
         raise AppError(401, "UNAUTHORIZED", "Wrong token type")
-    if payload.get("sub") in _revoked_tokens:
+    if payload.get("jti") in _revoked_tokens:
         raise AppError(401, "UNAUTHORIZED", "Token has been revoked")
     return payload
 
